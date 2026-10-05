@@ -5,19 +5,13 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import distance_transform_edt
 import math
 
-# Convenção do mapa DEPOIS do prep_map:
-#   255 = célula LIVRE e CONHECIDA (o robô pode andar)
-#   128 = célula DESCONHECIDA (o robô ainda não mapeou — não pode andar, mas o
-#         planejador pode atravessá-la para indicar a direção do objetivo)
-#     0 = PAREDE / obstáculo (jamais atravessar)
 LIVRE = 255
 DESCONHECIDO = 128
 PAREDE = 0
 
 
 class AStarPathfinder:
-    def __init__(self, map_array: np.array, start: tuple, goal: tuple, wall_influence=5.0, buffer_factor=2.0,
-                 map_resolution=0.05, safety_margin_m=0.24):
+    def __init__(self, map_array: np.array, start: tuple, goal: tuple, wall_influence=5.0, buffer_factor=2.0):
         """
         Inicializa o A* com mapa, ponto inicial, objetivo e parâmetros de influência.
 
@@ -27,12 +21,6 @@ class AStarPathfinder:
             goal (tuple): Ponto objetivo (linha, coluna).
             wall_influence (float): Peso da proximidade das paredes.
             buffer_factor (float): Escala da influência das paredes.
-            map_resolution (float): Tamanho de cada célula do mapa, em metros
-                (padrão 0.05 m = 5 cm, típico dos mapas do ROS).
-            safety_margin_m (float): DISTÂNCIA SEGURA CRÍTICA, em metros, do
-                centro do robô até qualquer parede. O A* trata como obstáculo
-                toda célula a menos dessa distância de uma parede (inflação de
-                obstáculos), então o caminho JAMAIS passa mais perto que isso.
         """
         self.start = start
         self.goal = goal
@@ -40,26 +28,13 @@ class AStarPathfinder:
         self.buffer_factor = buffer_factor
         self.GOAL_REACHEABLE = False
 
-        # Distância segura crítica convertida de metros para células.
-        # Ex.: 0.24 m / 0.05 m por célula = 4.8 -> 5 células de folga mínima.
-        self.map_resolution = map_resolution
-        self.safety_margin_m = safety_margin_m
-        self.safety_cells = int(math.ceil(safety_margin_m / map_resolution))
+        self.min_clearance = 4.0
 
-        # Distância mínima (em células) exigida na validação do caminho
-        # simplificado/suavizado — igual à distância segura crítica.
-        self.min_clearance = float(self.safety_cells)
-
-        # Prepara o mapa, expandindo suas bordas e ajustando o array.
         self.map = map_array.copy()
         self.map_array = self.preprocess_map(map_array)
 
-        # Cria um campo potencial baseado no mapa para influenciar o caminho.
         self.potential_field = self.create_potential_field()
 
-    # ------------------------------------------------------------------
-    # Pré-processamento e campo potencial
-    # ------------------------------------------------------------------
 
     def preprocess_map(self, map_array: np.array) -> np.array:
         """
@@ -76,7 +51,6 @@ class AStarPathfinder:
             np.array: Mapa processado.
         """
         processed = map_array.copy()
-        # Tudo que não é livre nem desconhecido vira obstáculo.
         processed[(processed != LIVRE) & (processed != DESCONHECIDO)] = PAREDE
         return processed
 
@@ -97,10 +71,9 @@ class AStarPathfinder:
             np.array: Campo potencial.
         """
         walls = (self.map_array == PAREDE)
-        # Distância de cada célula até a parede mais próxima (em células).
         self.dist_to_wall = distance_transform_edt(~walls)
         field = self.wall_influence * np.exp(-self.dist_to_wall / self.buffer_factor)
-        field[walls] = 0.0  # paredes já são bloqueadas na expansão do A*
+        field[walls] = 0.0
         return field
 
     def heuristic(self, a: tuple, b: tuple) -> float:
@@ -121,52 +94,10 @@ class AStarPathfinder:
         """
         return math.hypot(a[0] - b[0], a[1] - b[1])
 
-    # ------------------------------------------------------------------
-    # Núcleo do A*
-    # ------------------------------------------------------------------
-
-    def _mapa_inflado(self, celulas: float) -> np.array:
-        """
-        Inflação de obstáculos (configuration space): devolve uma cópia do mapa
-        em que toda célula a menos de `celulas` células de uma parede também
-        vira PAREDE. É o que garante, de forma RÍGIDA, a distância segura
-        crítica: o A* simplesmente não consegue planejar perto da parede.
-        """
-        inflado = self.map_array.copy()
-        inflado[self.dist_to_wall < celulas] = PAREDE
-        return inflado
 
     def find_path(self):
         """
         Executa o algoritmo A* para encontrar caminho até o objetivo.
-
-        Planeja sobre o mapa com obstáculos INFLADOS pela distância segura
-        crítica (24 cm do centro do robô): nenhuma célula do caminho fica a
-        menos que isso de uma parede. Se não existir caminho com a margem
-        completa (corredor estreito demais), tenta de novo com margens
-        reduzidas (75%, 50%, 25% e 0%), avisando no console — assim o robô
-        não trava em passagens apertadas, mas nunca planeja colado na parede
-        por escolha.
-
-        Returns:
-            dict: Predecessores dos nós no caminho. Se o caminho não for encontrado, retorna None.
-            tuple: O ponto final (objetivo) ou None se não encontrado.
-        """
-        for fator in (1.0, 0.75, 0.5, 0.25, 0.0):
-            inflacao = self.safety_cells * fator
-            grade = self._mapa_inflado(inflacao)
-            came_from, final_node = self._a_estrela(grade)
-            if final_node is not None:
-                if fator < 1.0:
-                    margem_cm = inflacao * self.map_resolution * 100
-                    print(f"Aviso: passagem estreita — margem de segurança reduzida para ~{margem_cm:.0f} cm")
-                return came_from, final_node
-        print("Caminho não encontrado")
-        return None, None
-
-    def _a_estrela(self, grade: np.array):
-        """
-        Núcleo do A*, operando sobre `grade` (mapa já inflado).
 
         Estratégia:
           - Fronteira (open list) como min-heap ordenada por f = g + h.
@@ -175,38 +106,33 @@ class AStarPathfinder:
           - O custo de entrar numa célula soma a penalidade do campo potencial
             (proximidade de parede) e um pequeno custo extra para células
             desconhecidas, para o robô preferir o que já é conhecido.
-          - Células bloqueadas na grade inflada (parede real ou colchão de
-            segurança) nunca são expandidas.
+          - Paredes nunca são expandidas.
 
         Returns:
-            dict: Predecessores dos nós no caminho (ou None).
+            dict: Predecessores dos nós no caminho. Se o caminho não for encontrado, retorna None.
             tuple: O ponto final (objetivo) ou None se não encontrado.
         """
         start, goal = self.start, self.goal
-        rows, cols = grade.shape
+        rows, cols = self.map_array.shape
 
         def dentro(r, c):
             return 0 <= r < rows and 0 <= c < cols
 
         def livre_de_parede(r, c):
-            return grade[r, c] != PAREDE
+            return self.map_array[r, c] != PAREDE
 
-        # Se o objetivo cair numa parede (ou dentro do colchão de segurança),
-        # procura a célula transitável mais próxima para ainda assim planejar
-        # na direção certa.
         if not dentro(*goal) or not livre_de_parede(*goal):
-            goal = self._nearest_free(goal, grade)
+            goal = self._nearest_free(goal)
             if goal is None:
+                print("Caminho não encontrado")
                 return None, None
             self.goal = goal
 
-        # (f, g, célula) — f é o critério de desempate da fila de prioridade.
         open_heap = [(self.heuristic(start, goal), 0.0, start)]
         came_from = {start: None}
         g_score = {start: 0.0}
         closed = set()
 
-        # 8 vizinhos: (dr, dc, custo do passo)
         vizinhos = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
                     (-1, -1, math.sqrt(2)), (-1, 1, math.sqrt(2)),
                     (1, -1, math.sqrt(2)), (1, 1, math.sqrt(2))]
@@ -218,9 +144,6 @@ class AStarPathfinder:
             closed.add(current)
 
             if current == goal:
-                # O objetivo só é "alcançável" de verdade se estiver na
-                # região conhecida (livre). Caso contrário, o caminho será
-                # truncado na borda do conhecido pelo know_path.
                 self.GOAL_REACHEABLE = (self.map[goal[0], goal[1]] == LIVRE)
                 return came_from, current
 
@@ -229,12 +152,10 @@ class AStarPathfinder:
                 nr, nc = r + dr, c + dc
                 if not dentro(nr, nc) or not livre_de_parede(nr, nc):
                     continue
-                # Não corta quina: diagonal só se os dois ortogonais forem livres.
                 if dr != 0 and dc != 0:
                     if not livre_de_parede(r + dr, c) or not livre_de_parede(r, c + dc):
                         continue
                 cell = self.map_array[nr, nc]
-                # Custo = passo + proximidade de parede + leve custo p/ desconhecido.
                 custo = step + self.potential_field[nr, nc]
                 if cell == DESCONHECIDO:
                     custo += 0.1
@@ -245,13 +166,15 @@ class AStarPathfinder:
                     f = tentative + self.heuristic((nr, nc), goal)
                     heapq.heappush(open_heap, (f, tentative, (nr, nc)))
 
+        print("Caminho não encontrado")
         return None, None
 
-    def _nearest_free(self, cell: tuple, grade: np.array):
-        """Retorna a célula transitável (na grade inflada) mais próxima de `cell` (ou None)."""
+    def _nearest_free(self, cell: tuple):
+        """Retorna a célula não-parede mais próxima de `cell` (ou None)."""
+        rows, cols = self.map_array.shape
         r0, c0 = int(round(cell[0])), int(round(cell[1]))
         best, best_d = None, math.inf
-        free_cells = np.argwhere(grade != PAREDE)
+        free_cells = np.argwhere(self.map_array != PAREDE)
         if len(free_cells) == 0:
             return None
         for r, c in free_cells:
@@ -304,9 +227,6 @@ class AStarPathfinder:
                 break
         return known
 
-    # ------------------------------------------------------------------
-    # Suavização do caminho (movimentos suaves, sem ziguezague)
-    # ------------------------------------------------------------------
 
     def simplify_path(self, path: list) -> list:
         """
@@ -336,7 +256,6 @@ class AStarPathfinder:
         if not path or len(path) < 3:
             return path
 
-        # Etapa 1: remove pontos colineares (mesma direção do anterior).
         reduzido = [path[0]]
         for i in range(1, len(path) - 1):
             d1 = (path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1])
@@ -345,12 +264,10 @@ class AStarPathfinder:
                 reduzido.append(path[i])
         reduzido.append(path[-1])
 
-        # Etapa 2: shortcut por linha de visão com verificação de clearance.
         suave = [reduzido[0]]
         anchor = 0
         while anchor < len(reduzido) - 1:
             proximo = anchor + 1
-            # Tenta ligar o anchor ao waypoint mais distante possível.
             for cand in range(len(reduzido) - 1, anchor, -1):
                 if self._line_of_sight(reduzido[anchor], reduzido[cand]):
                     proximo = cand
@@ -358,7 +275,6 @@ class AStarPathfinder:
             suave.append(reduzido[proximo])
             anchor = proximo
 
-        # Etapa 3: corta os cantos vivos, gerando curvas suaves e seguras.
         return self._chaikin_seguro(suave, iteracoes=3)
 
     def _chaikin_seguro(self, pontos: list, iteracoes=3) -> list:
@@ -382,9 +298,9 @@ class AStarPathfinder:
                 q1 = (0.75 * v[0] + 0.25 * a[0], 0.75 * v[1] + 0.25 * a[1])
                 q2 = (0.75 * v[0] + 0.25 * b[0], 0.75 * v[1] + 0.25 * b[1])
                 if self._segmento_seguro(a, q1) and self._segmento_seguro(q1, q2):
-                    novo.extend([q1, q2])   # canto vira curva
+                    novo.extend([q1, q2])
                 else:
-                    novo.append(v)          # canto preservado (espaço estreito)
+                    novo.append(v)
             novo.append(pts[-1])
             pts = novo
         return pts
@@ -413,9 +329,6 @@ class AStarPathfinder:
         """
         return self._segmento_seguro(a, b)
 
-    # ------------------------------------------------------------------
-    # Visualização e orquestração
-    # ------------------------------------------------------------------
 
     def path_to_xy(self, path: list) -> list:
         """
@@ -487,7 +400,6 @@ class AStarPathfinder:
             print("Caminho encontrado, simplificando...")
             simplified_path = self.simplify_path(path)
 
-            # Entrega o caminho simplificado como lista [(x1, y1), (x2, y2), ...]
             self.caminho_xy = self.path_to_xy(simplified_path)
             print(f"Caminho simplificado ({len(self.caminho_xy)} pontos, formato (x, y)):")
             print(self.caminho_xy)
@@ -527,14 +439,11 @@ def prep_map(map_path: str) -> np.array:
 
 
 def main():
-    # Testa o planejador nos 5 mapas de exemplo.
     for i in range(1, 6):
         print(f"\n===== map{i}.pgm =====")
         map_array = prep_map(f'map{i}.pgm')
         astar = AStarPathfinder(map_array, (60, 20), (60, 120),
                                 wall_influence=10.0, buffer_factor=3.0)
-        # Ao rodar: plota o gráfico (e salva em caminho_map{i}.png) e imprime
-        # a lista [(x1, y1), (x2, y2), ...] com o caminho simplificado.
         caminho = astar.run(save_path=f'caminho_map{i}.png')
         if caminho:
             print(f"Objetivo alcançável (região conhecida): {astar.GOAL_REACHEABLE}")
